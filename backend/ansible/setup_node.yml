@@ -1,0 +1,114 @@
+---
+- name: Deploy Perfect Marzban Node with Hysteria2
+  hosts: all
+  become: true
+  vars:
+    main_panel_ip: "0.0.0.0/0"
+    panel_cert: ""
+    node_domain: ""         
+    email: "email@email" 
+    
+  tasks:
+    # 1. ПОДГОТОВКА
+    - name: Remove old node container
+      docker_container:
+        name: marzban-node
+        state: absent
+      ignore_errors: yes
+
+    - name: Install dependencies
+      apt:
+        pkg: ['curl', 'ufw', 'fail2ban', 'certbot', 'rsync']
+        state: present
+        update_cache: yes
+
+    - name: Install Docker
+      shell: curl -fsSL https://get.docker.com | sh
+      args:
+        creates: /usr/bin/docker
+
+    # 2. ПОЛУЧЕНИЕ СЕРТИФИКАТА
+    - name: Stop HTTP services for Certbot
+      shell: "fuser -k 80/tcp || true"
+
+    - name: Obtain SSL Certificate
+      command: >
+        certbot certonly --standalone 
+        --non-interactive 
+        --agree-tos 
+        --email {{ email }} 
+        -d {{ node_domain }}
+      # Запускаем только если сертификата еще нет
+      args:
+        creates: "/etc/letsencrypt/live/{{ node_domain }}/fullchain.pem"
+
+    # 3. КОПИРОВАНИЕ И ПРАВА (САМОЕ ВАЖНОЕ!)
+    - name: Create node certs directory
+      file: 
+        path: /var/lib/marzban-node/certs
+        state: directory
+        mode: '0755' # rwxr-xr-x (Все могут зайти в папку)
+
+    - name: Copy Fullchain
+      copy:
+        src: "/etc/letsencrypt/live/{{ node_domain }}/fullchain.pem"
+        dest: /var/lib/marzban-node/certs/fullchain.pem
+        remote_src: yes
+        mode: '0644' # rw-r--r-- (Все могут читать)
+
+    - name: Copy Private Key
+      copy:
+        src: "/etc/letsencrypt/live/{{ node_domain }}/privkey.pem"
+        dest: /var/lib/marzban-node/certs/key.pem
+        remote_src: yes
+        mode: '0644' # rw-r--r-- (Все могут читать)
+
+    # 4. ФАЕРВОЛ
+    - name: Enable Fail2Ban
+      service: name=fail2ban state=started enabled=yes
+
+    - name: UFW - Reset
+      ufw: direction=incoming policy=deny state=enabled
+
+    - name: UFW - Allow Ports
+      ufw: rule=allow port={{ item.port }} proto={{ item.proto }}
+      loop:
+        - { port: '22', proto: 'tcp' }
+        - { port: '80', proto: 'tcp' }
+        - { port: '443', proto: 'tcp' } # Reality
+        - { port: '443', proto: 'udp' } # Hysteria2
+        - { port: '62050', proto: 'tcp' }
+        - { port: '62051', proto: 'tcp' }
+
+    # 5. СЕРТИФИКАТ ПАНЕЛИ
+    - name: Write Panel CA Certificate
+      copy: 
+        content: "{{ panel_cert }}" 
+        dest: /var/lib/marzban-node/ssl_client_cert.pem
+        mode: '0644'
+
+    # 6. ЗАПУСК КОНТЕЙНЕРА
+    - name: Run Marzban Node
+      docker_container:
+        name: marzban-node
+        image: gozargah/marzban-node:latest
+        restart_policy: always
+        network_mode: host
+        env:
+          SSL_CLIENT_CERT_FILE: "/var/lib/marzban-node/ssl_client_cert.pem"
+          SERVICE_PORT: "62050"
+          XRAY_API_PORT: "62051"
+        volumes:
+          # Папка для логов и служебных файлов
+          - /var/lib/marzban-node:/var/lib/marzban-node
+          # Папка с сертификатами (Пробрасываем внутрь Xray)
+          - /var/lib/marzban-node/certs:/var/lib/marzban/certs
+
+    # 7. АВТО-ОБНОВЛЕНИЕ (CRON)
+    # Так как мы КОПИРУЕМ файлы, нам нужно обновлять копии после продления
+    - name: Setup Auto-Renew Cron
+      cron:
+        name: "Renew Certs Copy and Restart"
+        minute: "0"
+        hour: "3"
+        job: "certbot renew --quiet --pre-hook 'docker stop marzban-node' --post-hook 'cp /etc/letsencrypt/live/{{ node_domain }}/fullchain.pem /var/lib/marzban-node/certs/fullchain.pem && cp /etc/letsencrypt/live/{{ node_domain }}/privkey.pem /var/lib/marzban-node/certs/key.pem && chmod 644 /var/lib/marzban-node/certs/* && docker start marzban-node'"

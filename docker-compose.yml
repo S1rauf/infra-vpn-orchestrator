@@ -1,0 +1,173 @@
+services:
+  # --- CADDY ---
+  caddy:
+    image: caddy:latest
+    container_name: gateway
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      # === ФОРМИРОВАНИЕ ДОМЕНОВ ===
+      
+      - DOMAIN_SITE=${IS_TEST_ENV:+test.}${MAIN_DOMAIN}
+      
+      - DOMAIN_BOT=bot${IS_TEST_ENV:+-test}.${MAIN_DOMAIN}
+     
+      - DOMAIN_PANEL=panel${IS_TEST_ENV:+-test}.${MAIN_DOMAIN}
+      
+      - DOMAIN_SUB=sub${IS_TEST_ENV:+-test}.${MAIN_DOMAIN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy_data:/data
+      - caddy_config:/config
+    logging: &default-logging
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - network
+    depends_on:
+      - backend
+      - marzban
+
+  # ----------------------------------------------------
+  # БАЗА ДАННЫХ
+  # ----------------------------------------------------
+  db:
+    image: postgres:15-alpine
+    container_name: db
+    logging: *default-logging
+    restart: always
+    environment:
+      POSTGRES_USER: 
+      POSTGRES_PASSWORD: 
+      POSTGRES_DB: 
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - network
+
+  # === АВТОМАТИЧЕСКИЕ БЭКАПЫ ===
+  db-backup:
+    image: prodrigestivill/postgres-backup-local
+    container_name: backup
+    restart: always
+    environment:
+      POSTGRES_HOST: 
+      POSTGRES_DB: 
+      POSTGRES_USER: 
+      POSTGRES_PASSWORD: SuperSecureDbPassword
+      SCHEDULE: "@every 6h"      # Каждые 6 часов
+      BACKUP_KEEP_DAYS: 7        # Хранить 7 дней
+      BACKUP_KEEP_WEEKS: 4       # Хранить 4 недельных
+      BACKUP_KEEP_MONTHS: 6      # Хранить 6 месячных
+    volumes:
+      - ./backups:/backups
+    depends_on:
+      - db
+    networks:
+      - network
+
+  # ----------------------------------------------------
+  # КЭШ (REDIS)
+  # ----------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    logging: *default-logging
+    restart: always
+    volumes:
+      - redis_data:/data
+    networks:
+      - network
+
+  # ----------------------------------------------------
+  # MARZBAN (Панель управления VPN)
+  # ----------------------------------------------------
+  marzban:
+    image: gozargah/marzban:latest
+    container_name: marzban
+    logging: *default-logging
+    restart: always
+    ports:
+       - '442:442/tcp'
+       - '442:442/udp'
+       - "2053:2053/tcp"
+       - "2083:2083/tcp"
+       - "8443:8443/tcp"
+       - "2096:2096/tcp"
+       - "441:441/tcp"
+
+    command: uvicorn main:app --host 0.0.0.0 --port 8000
+    environment:
+      DOCS: "True"
+      TELEGRAM_API_TOKEN: 
+      TELEGRAM_ADMIN_ID: 
+      MARZBAN_SUDO_USERNAME: 
+      MARZBAN_SUDO_PASSWORD: 
+      XRAY_EXECUTABLE_PATH: /usr/local/bin/xray
+      XRAY_JSON: /var/lib/marzban/xray_config.json
+      SQLALCHEMY_DATABASE_URL: sqlite:////var/lib/marzban/db.sqlite3
+      XRAY_SUBSCRIPTION_URL_PREFIX: https://sub${IS_TEST_ENV:+-test}.${MAIN_DOMAIN}
+      JWT_ACCESS_TOKEN_EXPIRE_MINUTES: 5256000
+    volumes:
+      - ./marzban-data:/var/lib/marzban
+    networks:
+      - network
+
+  # ----------------------------------------------------
+  # БЕЗОПАСНЫЙ ПРОКСИ ДЛЯ DOCKER
+  # ----------------------------------------------------
+  docker-proxy:
+    image: tecnativa/docker-socket-proxy
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      CONTAINERS: 1
+      POST: 1 # Разрешаем start/stop/restart
+    networks:
+      - network
+
+  # ----------------------------------------------------
+  # BACKEND (Наш бот)
+  # ----------------------------------------------------
+  backend:
+    build: 
+      context: ./backend
+    container_name: backend
+    logging: &default-logging  
+      driver: "json-file"
+      options:
+        max-size: "10m"       # Максимум 10 МБ на файл
+        max-file: "3"         # Хранить не более 3 файлов (итого 30 МБ)
+    restart: always
+    env_file: .env
+    environment:
+      - DOCKER_HOST=tcp://docker-proxy:2375
+      - WEBHOOK_BASE_URL=https://bot${IS_TEST_ENV:+-test}.${MAIN_DOMAIN}
+    volumes:
+      - ./backend/app:/app
+      - ./backend/ansible:/app/ansible
+      - ./marzban-data/certs:/var/lib/marzban/certs:ro
+    depends_on:
+      - db
+      - redis
+      - docker-proxy
+      - marzban
+    ports:
+      - "8008:8008"
+    networks:
+      - network
+
+networks:
+  network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  caddy_data:
+  caddy_config:
